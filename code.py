@@ -7,7 +7,7 @@ from functools import reduce
 from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter
 import pickle
 from scipy import sparse
-from scipy.sparse import csc_matrix
+from scipy.sparse import coo_matrix
 from numba import jit
 
 def timestamp(msg=""):
@@ -93,21 +93,26 @@ with open("model/voc.pkl", "rb") as fp:
     voc = pickle.load(fp)
 
 #%%
-row = []
-col = []
-data = []
-for i, w_i in tqdm(enumerate(voc)):
-    for j in range(len(d_list)):
-        if list_d_tf[j][w_i] != 0:
-            row += [i]
-            col += [j]
-            data += [list_d_tf[j][w_i]]
-row = np.array(row)
-col = np.array(col)
-data = np.array(data)
-tf_array = csc_matrix((data, (row, col)))
-sparse.save_npz('model/tf_array.npz', tf_array)
-del row,col,data
+def counter2array(voc, li, path):
+    row = []
+    col = []
+    data = []
+    for i, w_i in tqdm(enumerate(voc)):
+        for j in range(len(li)):
+            if list_d_tf[j][w_i] != 0:
+                row += [i]
+                col += [j]
+                data += [list_d_tf[j][w_i]]
+    row = np.array(row)
+    col = np.array(col)
+    data = np.array(data)
+    tf_array = coo_matrix((data, (row, col)))
+    sparse.save_npz(path, tf_array)
+    del row,col,data
+    return tf_array
+
+#%%
+tf_array = counter2array(voc, d_list, 'model/tf_array.npz')
 
 #%%
 tf_array = sparse.load_npz("model/tf_array.npz")
@@ -144,7 +149,33 @@ with open("model/bm_df.pkl", "rb") as fp:
 BG = np.load("model/BG.npy")
 
 #%%
-# sim_array
+tf_array = tf_array.tocsr()
+small_tf_array = []
+small_voc = []
+small_BG = []
+for arg in BG.argsort()[-5000: ]:
+    small_tf_array += [tf_array[arg]]
+    small_voc += [voc[arg]]
+    small_BG += [BG[arg]]
+small_tf_array = sparse.vstack([row for row in small_tf_array]).toarray()
+small_BG = np.array(small_BG)
+
+#%%
+with open("model/small_voc.pkl", "wb") as fp:
+    pickle.dump(small_voc, fp)
+np.save("model/small_tf_array.npy", small_tf_array)
+q_tf_array = counter2array(small_voc, q_list, 'model/q_tf_array.npz')
+np.save("model/small_BG.npy", small_BG)
+
+#%%
+with open("model/small_voc.pkl", "rb") as fp:
+    small_voc = pickle.load(fp)
+small_tf_array = np.load("model/small_tf_array.npy")
+q_tf_array = sparse.load_npz('model/q_tf_array.npz')
+
+
+#%%
+# bm_sim_array
 bm_sim_array = np.zeros([len(q_list), len(d_list)])
 for q in tqdm(range(len(q_list))):
     for d in range(len(d_list)):
@@ -170,50 +201,63 @@ def E_step(T_given_w, P_smm, BG, V, A, total_len):
         T_given_w[i] = (1-A)*P_smm[i] / ((1-A)*P_smm[i] + A*BG[i]/total_len)
     return T_given_w
 
-# @jit(nopython=True)
+@jit(nopython=True)
 def M_step(tf_array, P_smm, T_given_w, V):
     for i in range(V):
         P_smm[i] = (tf_array[i]*T_given_w[i]).sum()
     P_smm /= P_smm.sum()
     return P_smm
 
+@jit(nopython=True)
+def sim(sim_array, D, V, A, B, P_smm, BG, total_len, q_tf_array, tf_array, doc_len, q):
+    # for d in tqdm(range(D)):
+    #     for i in range(V):
+    #         if tf_array[i][d] != 0:
+    #             sim_array[q][d] += (A*q_tf_array[i][q]/q_tf_array[:,q].sum() + B*P_smm[i] + (1-A-B)*BG[i]/total_len) * \
+    #                 tf_array[i][d]/doc_len[d] * BG[i]/total_len
+    
+    for i in range(V):
+        w_given_q = (A*q_tf_array[i][q]/q_tf_array[:, q].sum() + B*P_smm[i] + (1-A-B)*BG[i]/total_len)
+        w_given_q *= BG[i]/total_len
+        for d in range(D):
+            if tf_array[i][d] != 0:
+                sim_array[q][d] += w_given_q * tf_array[i][d]/doc_len[d]
+    return sim_array
+
 #%%
 sim_array = np.zeros([len(q_list), len(d_list)])
-for q in range(len(q_list)):
+for q in tqdm(range(len(q_list))):
     # initial
-    T_given_w = np.zeros(len(voc))
-    P_smm = np.random.rand(len(voc))
+    T_given_w = np.zeros(len(small_voc))
+    P_smm = np.random.rand(len(small_voc))
     P_smm /= P_smm.sum()
     log_likelihood = 0.0
 
-    timestamp("relate_tf")
-    relate_arg = np.argsort(bm_sim_array[q])[:1000] ###
+    # timestamp("relate_tf")
     relate_tf = []
-    for arg in relate_arg:
+    tf_array = tf_array.tocsc()
+    for arg in np.argsort(bm_sim_array[q])[-1000: ]: # most simmilar doc
         relate_tf += [tf_array[:, arg]]
     relate_tf = sparse.hstack([col for col in relate_tf]).toarray()
     # relate_tf = np.array(relate_tf).transpose()
 
-    timestamp("EM start")
+    # timestamp("EM start")
     for step in (range(args.train_from, args.step)):
         # E-step
         # timestamp(f"\n{step+1}\t--E-step--")
         # timestamp("P(T_smm|w)")
-        T_given_w = E_step(T_given_w, P_smm, BG, len(voc), A, total_len)
+        T_given_w = E_step(T_given_w, P_smm, small_BG, len(small_voc), A, total_len)
 
         # M-step
         # timestamp("--M-step--")
         # timestamp("P_smm(w)")
-        P_smm = M_step(relate_tf, P_smm, T_given_w, len(voc))
+        P_smm = M_step(relate_tf, P_smm, T_given_w, len(small_voc))
         # timestamp("---")
 
         # TODO: log_likelihood
 
-    timestamp("sim_arry")
-    for d in tqdm(range(len(d_list))):
-        for i, w in enumerate(voc):
-            sim_array[q][d] += (A/3 + B* + (1-A-B)*BG[i]/total_len) * \
-                list_d_tf[d][w]/doc_len[d]
+    # timestamp("sim_arry")
+    sim_array = sim(sim_array, len(d_list), len(small_voc), A, B, P_smm, BG, total_len, q_tf_array.toarray(), small_tf_array, doc_len, q)
 sim_array *= -1
 
 #%%
@@ -228,3 +272,4 @@ with open('result.csv', 'w') as output_file:
             output_file.write(d_list[j]+' ')
         output_file.write('\n')
 timestamp()
+# %%
