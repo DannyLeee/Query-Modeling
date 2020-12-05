@@ -36,14 +36,14 @@ class dotdict(dict):
     __getattr__ = dict.get
     __setattr__ = dict.__setitem__
     __delattr__ = dict.__delitem__
-args = dotdict(bm_B=0.7, K1=0.8, K3=-1, A=0.3, B=0.3, step=30, scratch=0)
+args = dotdict(bm_B=0.7, K1=0.8, K3=-1, KL_A=0.4, KL_B=0.4, A=0.5, step=30, scratch=0)
 
 bm_B = args.bm_B
 K1 = args.K1
 K3 = args.K3
+KL_A = args.KL_A
+KL_B = args.KL_B
 A = args.A
-B = args.B
-
 
 #%%
 timestamp()
@@ -66,6 +66,7 @@ list_q_tf = []
 list_d_tf = []
 doc_list = []
 query_list = []
+doc_len = []
 for txt in tqdm(file_iter("q")):
     list_q_tf += [Counter(txt.split())]
     query_list += [txt]
@@ -73,6 +74,9 @@ for txt in tqdm(file_iter("q")):
 for txt in tqdm(file_iter("d")):
     list_d_tf += [Counter(txt.split())]
     doc_list += [txt]
+    doc_len += [len(txt.split())]
+doc_avg_len = np.array(doc_len).mean()
+total_len = sum(doc_len)
 
 #%%
 # voc
@@ -88,16 +92,19 @@ else:
         voc = pickle.load(fp)
 
 #%%
-def counter2array(voc, li, path):
+def counter2array(voc, li, path, list_of_counter):
     row = []
     col = []
     data = []
     for i, w_i in tqdm(enumerate(voc)):
+        row += [i]
+        col += [0]
+        data += [0]
         for j in range(len(li)):
-            if list_d_tf[j][w_i] != 0:
+            if list_of_counter[j][w_i] != 0:
                 row += [i]
                 col += [j]
-                data += [list_d_tf[j][w_i]]
+                data += [list_of_counter[j][w_i]]
     row = np.array(row)
     col = np.array(col)
     data = np.array(data)
@@ -108,16 +115,9 @@ def counter2array(voc, li, path):
 
 #%%
 if args.scratch:
-    tf_array = counter2array(voc, d_list, 'model/tf_array.npz')
+    tf_array = counter2array(voc, d_list, 'model/tf_array.npz', list_d_tf)
 else:
     tf_array = sparse.load_npz("model/tf_array.npz")
-
-#%%
-doc_len = []
-for j, doc in tqdm(enumerate(doc_list)):
-    doc_len += [len(doc)]
-doc_avg_len = np.array(doc_len).mean()
-total_len = sum(doc_len)
 
 #%%
 # df
@@ -137,11 +137,12 @@ if args.scratch:
         pickle.dump(bm_df, fp)
     np.save("model/BG.npy", BG)
 else:
-    # with open("model/bm_df.pkl", "rb") as fp:
-    #     bm_df = pickle.load(fp)
+    with open("model/bm_df.pkl", "rb") as fp:
+        bm_df = pickle.load(fp)
     BG = np.load("model/BG.npy")
 
 #%%
+# small voc
 if args.scratch:
     tf_array = tf_array.tocsr()
     small_tf_array = []
@@ -157,7 +158,7 @@ if args.scratch:
     with open("model/small_voc.pkl", "wb") as fp:
         pickle.dump(small_voc, fp)
     np.save("model/small_tf_array.npy", small_tf_array)
-    q_tf_array = counter2array(small_voc, q_list, 'model/q_tf_array.npz')
+    q_tf_array = counter2array(small_voc, q_list, 'model/q_tf_array.npz', list_q_tf)
     np.save("model/small_BG.npy", small_BG)
 else:
     with open("model/small_voc.pkl", "rb") as fp:
@@ -199,38 +200,46 @@ def M_step(tf_array, P_smm, T_given_w, V):
     return P_smm
 
 @jit(nopython=True)
-def sim(sim_array, D, V, A, B, P_smm, BG, total_len, q_tf_array, tf_array, doc_len, q):
-    # for d in range(D):
-    #     for i in range(V):
-    #         if tf_array[i][d] != 0:
-    #             sim_array[q][d] += (A*q_tf_array[i][q]/q_tf_array[:,q].sum() + B*P_smm[i] + (1-A-B)*BG[i]/total_len) * \
-    #                 tf_array[i][d]/doc_len[d] * BG[i]/total_len
-    
+def sim(sim_array, D, V, A, B, P_smm, BG, q_tf_array, tf_array, doc_len, q, total_len):
     for i in range(V):
-        w_given_q = (A*q_tf_array[i][q]/q_tf_array[:, q].sum() + B*P_smm[i] + (1-A-B)*BG[i]/total_len)
+        P_BG = BG[i]/total_len
+        if q_tf_array[:, q].sum() != 0: 
+            w_given_q = (A*q_tf_array[i][q]/q_tf_array[:, q].sum() + B*P_smm[i] + (1-A-B)*P_BG)
+        else: # OOV
+            w_given_q = (B*P_smm[i] + (1-A-B)*P_BG)
         for d in range(D):
-            if tf_array[i][d] != 0:
-                sim_array[q][d] += w_given_q * \
-                    (0.4*tf_array[i][d]/doc_len[d] + 0.6*BG[i]/total_len)
-
+            sim_array[q][d] += w_given_q * \
+                np.log(0.4*tf_array[i][d]/doc_len[d] + 0.6*P_BG)
+    sim_array *= -1
     return sim_array
 
 #%%
+# @jit(nopython=True)
+# def log_like(P_smm, BG, tf_array, D, V, A):
+#     log_likelihood = 1.0
+#     total_len = BG.sum()
+#     for d in range(D):
+#         for i in range(V):
+#             if tf_array[i][d] != 0:
+#                 log_likelihood *= (1 + (1-A)*P_smm[i] + A*BG[i]/total_len) \
+#                 **tf_array[i][d]
+#     return log_likelihood
+
 sim_array = np.zeros([len(q_list), len(d_list)])
 for q in tqdm(range(len(q_list))):
     # initial
     T_given_w = np.zeros(len(small_voc))
     P_smm = np.random.rand(len(small_voc))
     P_smm /= P_smm.sum()
-    log_likelihood = 0.0
 
     # timestamp("relate_tf")
     relate_tf = []
-    tf_array = tf_array.tocsc()
-    for arg in np.argsort(bm_sim_array[q])[-1000: ]: # most simmilar doc
-        relate_tf += [tf_array[:, arg]]
-    relate_tf = sparse.hstack([col for col in relate_tf]).toarray()
-    # relate_tf = np.array(relate_tf).transpose()
+    relate_arg = np.argsort(bm_sim_array[q])[-10:]
+    # tf_array = tf_array.tocsc()
+    # for arg in relate_arg: # most simmilar doc
+    #     relate_tf += [tf_array[:, arg]]
+    # relate_tf = sparse.hstack([col for col in relate_tf]).toarray()
+    relate_tf = np.vstack([small_tf_array[:, _] for _ in relate_arg]).transpose()
 
     # timestamp("EM start")
     for step in (range(args.step)):
@@ -246,10 +255,11 @@ for q in tqdm(range(len(q_list))):
         # timestamp("---")
 
         # TODO: log_likelihood
+        # log_likelihood = log_like(P_smm, small_BG, relate_tf, relate_tf.shape[1], relate_tf.shape[0], A)
+        # timestamp("log_likelihood"+ '\t' +str(log_likelihood))
 
     # timestamp("sim_arry")
-    sim_array = sim(sim_array, len(d_list), len(small_voc), A, B, P_smm, BG, total_len, q_tf_array.toarray(), small_tf_array, doc_len, q)
-sim_array *= -1
+    sim_array = sim(sim_array, len(d_list), len(small_voc), KL_A, KL_B, P_smm, small_BG, q_tf_array.toarray(), small_tf_array, doc_len, q, total_len)
 
 #%%
 # output
@@ -257,8 +267,8 @@ with open('result.csv', 'w') as output_file:
     output_file.write("Query,RetrievedDocuments\n")
     for i, q_id in tqdm(enumerate(q_list)):
         output_file.write(q_id+',')
-        sorted = np.argsort(sim_array[i])
-        sorted = np.flip(sorted)[:5000]
+        sorted = np.argsort(sim_array[i])[:5000]
+        # sorted = np.flip(sorted)[:5000]
         for _, j in enumerate(sorted):
             output_file.write(d_list[j]+' ')
         output_file.write('\n')
