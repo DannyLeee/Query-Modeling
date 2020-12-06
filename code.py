@@ -36,14 +36,15 @@ class dotdict(dict):
     __getattr__ = dict.get
     __setattr__ = dict.__setitem__
     __delattr__ = dict.__delitem__
-args = dotdict(bm_B=0.7, K1=0.8, K3=-1, KL_A=0.4, KL_B=0.4, A=0.5, step=30, scratch=0)
+args = dotdict(A=5, B=1, scratch=0)
 
-bm_B = args.bm_B
-K1 = args.K1
-K3 = args.K3
-KL_A = args.KL_A
-KL_B = args.KL_B
+# bm_B = args.bm_B
+# K1 = args.K1
+# K3 = args.K3
+# KL_A = args.KL_A
+# KL_B = args.KL_B
 A = args.A
+B = args.B
 
 #%%
 timestamp()
@@ -168,98 +169,36 @@ else:
     small_BG = np.load("model/small_BG.npy")
 
 #%%
-# bm_sim_array
-if args.scratch:
-    bm_sim_array = np.zeros([len(q_list), len(d_list)])
-    for q in tqdm(range(len(q_list))):
-        for d in range(len(d_list)):
-            for w in query_list[q].split():
-                d_tf = (K1+1)*list_d_tf[d][w] / (K1*((1-bm_B) + bm_B*doc_len[d]/doc_avg_len) + list_d_tf[d][w])
-                q_tf = (K3+1)*list_q_tf[q][w] / (K3+list_q_tf[q][w]) if K3 != -1 else 1
-                idf = np.log(1+(len(d_list)-bm_df[w]+0.5) / (bm_df[w]+0.5))
-                idf = np.power(idf, 2)
-                bm_sim_array[q][d] += d_tf * q_tf * idf
-    np.save("model/bm_sim.npy", bm_sim_array)
-else:
-    bm_sim_array = np.load("model/bm_sim.npy")
-
-#=================== BM25 ===================#
+#idf
+idf = np.log(1+(len(d_list)+1) / (np.count_nonzero(small_tf_array, axis=1)+1))
 
 #%%
-@jit(nopython=True)
-def E_step(T_given_w, P_smm, BG, V, A, total_len):
-    for i in range(V):
-        T_given_w[i] = (1-A)*P_smm[i] / ((1-A)*P_smm[i] + A*BG[i]/total_len)
-    return T_given_w
+# tfidf
+np_q_tfidf = (1 + np.ma.log2(q_tf_array.toarray())).transpose() * idf
+np_d_tfidf = (1 + np.ma.log2(small_tf_array)).transpose() * idf
+# del np_q_tf, np_d_tf
 
-@jit(nopython=True)
-def M_step(tf_array, P_smm, T_given_w, V):
-    for i in range(V):
-        P_smm[i] = (tf_array[i]*T_given_w[i]).sum()
-    P_smm /= P_smm.sum()
-    return P_smm
-
-@jit(nopython=True)
-def sim(sim_array, D, V, A, B, P_smm, BG, q_tf_array, tf_array, doc_len, q, total_len):
-    for i in range(V):
-        P_BG = BG[i]/total_len
-        if q_tf_array[:, q].sum() != 0: 
-            w_given_q = (A*q_tf_array[i][q]/q_tf_array[:, q].sum() + B*P_smm[i] + (1-A-B)*P_BG)
-        else: # OOV
-            w_given_q = (B*P_smm[i] + (1-A-B)*P_BG)
-        for d in range(D):
-            sim_array[q][d] += w_given_q * \
-                np.log(0.4*tf_array[i][d]/doc_len[d] + 0.6*P_BG)
-    sim_array *= -1
-    return sim_array
+np_q_tfidf = np_q_tfidf.filled(0)
+np_d_tfidf = np_d_tfidf.filled(0)
 
 #%%
-# @jit(nopython=True)
-# def log_like(P_smm, BG, tf_array, D, V, A):
-#     log_likelihood = 1.0
-#     total_len = BG.sum()
-#     for d in range(D):
-#         for i in range(V):
-#             if tf_array[i][d] != 0:
-#                 log_likelihood *= (1 + (1-A)*P_smm[i] + A*BG[i]/total_len) \
-#                 **tf_array[i][d]
-#     return log_likelihood
+from sklearn.metrics.pairwise import cosine_similarity
+sim_array = cosine_similarity(np_q_tfidf, np_d_tfidf)
+sim_array = np.array(sim_array)
+#========== VSM ==========#
 
-sim_array = np.zeros([len(q_list), len(d_list)])
+#%%
+new_q_tfidf = np.zeros(len(small_voc))
 for q in tqdm(range(len(q_list))):
-    # initial
-    T_given_w = np.zeros(len(small_voc))
-    P_smm = np.random.rand(len(small_voc))
-    P_smm /= P_smm.sum()
-
-    # timestamp("relate_tf")
-    relate_tf = []
-    relate_arg = np.argsort(bm_sim_array[q])[-10:]
-    # tf_array = tf_array.tocsc()
-    # for arg in relate_arg: # most simmilar doc
-    #     relate_tf += [tf_array[:, arg]]
-    # relate_tf = sparse.hstack([col for col in relate_tf]).toarray()
-    relate_tf = np.vstack([small_tf_array[:, _] for _ in relate_arg]).transpose()
-
-    # timestamp("EM start")
-    for step in (range(args.step)):
-        # E-step
-        # timestamp(f"\n{step+1}\t--E-step--")
-        # timestamp("P(T_smm|w)")
-        T_given_w = E_step(T_given_w, P_smm, small_BG, len(small_voc), A, total_len)
-
-        # M-step
-        # timestamp("--M-step--")
-        # timestamp("P_smm(w)")
-        P_smm = M_step(relate_tf, P_smm, T_given_w, len(small_voc))
-        # timestamp("---")
-
-        # TODO: log_likelihood
-        # log_likelihood = log_like(P_smm, small_BG, relate_tf, relate_tf.shape[1], relate_tf.shape[0], A)
-        # timestamp("log_likelihood"+ '\t' +str(log_likelihood))
-
-    # timestamp("sim_arry")
-    sim_array = sim(sim_array, len(d_list), len(small_voc), KL_A, KL_B, P_smm, small_BG, q_tf_array.toarray(), small_tf_array, doc_len, q, total_len)
+    relate_doc_vac = []
+    relate_arg = np.argsort(sim_array[q])[-5:]
+    relate_doc_vac = np.vstack([np_d_tfidf[_, :] for _ in relate_arg])
+    relate_doc_vac = relate_doc_vac.sum(0)
+    new_q_vac = A*np_q_tfidf[q] + B*relate_doc_vac/5
+    new_q_tfidf = np.vstack((new_q_tfidf, new_q_vac))
+new_q_tfidf = new_q_tfidf[1:]
+sim_array = cosine_similarity(new_q_tfidf, np_d_tfidf)
+sim_array = np.array(sim_array)
 
 #%%
 # output
@@ -267,9 +206,10 @@ with open('result.csv', 'w') as output_file:
     output_file.write("Query,RetrievedDocuments\n")
     for i, q_id in tqdm(enumerate(q_list)):
         output_file.write(q_id+',')
-        sorted = np.argsort(sim_array[i])[:5000]
-        # sorted = np.flip(sorted)[:5000]
+        sorted = np.argsort(sim_array[i])[-5000:]
+        sorted = np.flip(sorted)
         for _, j in enumerate(sorted):
             output_file.write(d_list[j]+' ')
         output_file.write('\n')
 timestamp()
+# %%
