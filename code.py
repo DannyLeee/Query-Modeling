@@ -31,12 +31,13 @@ def file_iter(_type):
 # parser.add_argument("-K3", default=-1, type=float ,help="if K3 =-1 not use query TF")
 # args = parser.parse_args()
 
+#%%
 class dotdict(dict):
     """dot.notation access to dictionary attributes"""
     __getattr__ = dict.get
     __setattr__ = dict.__setitem__
     __delattr__ = dict.__delitem__
-args = dotdict(A=5, B=1, scratch=0)
+args = dotdict(A=1, B=0.8, C=0.1, step=5, scratch=0)
 
 # bm_B = args.bm_B
 # K1 = args.K1
@@ -45,6 +46,7 @@ args = dotdict(A=5, B=1, scratch=0)
 # KL_B = args.KL_B
 A = args.A
 B = args.B
+C = args.C
 
 #%%
 timestamp()
@@ -149,56 +151,97 @@ if args.scratch:
     small_tf_array = []
     small_voc = []
     small_BG = []
-    for arg in BG.argsort()[-10000: ]:
+    for arg in tqdm(BG.argsort()[-10000: ]):
         small_tf_array += [tf_array[arg]]
         small_voc += [voc[arg]]
         small_BG += [BG[arg]]
-    small_tf_array = sparse.vstack([row for row in small_tf_array]).toarray()
+    small_tf_array = sparse.vstack([row for row in small_tf_array])
     small_BG = np.array(small_BG)
 
     with open("model/small_voc.pkl", "wb") as fp:
         pickle.dump(small_voc, fp)
-    np.save("model/small_tf_array.npy", small_tf_array)
+    sparse.save_npz("model/small_tf_array.npz", small_tf_array)
     q_tf_array = counter2array(small_voc, q_list, 'model/q_tf_array.npz', list_q_tf)
     np.save("model/small_BG.npy", small_BG)
 else:
     with open("model/small_voc.pkl", "rb") as fp:
         small_voc = pickle.load(fp)
-    small_tf_array = np.load("model/small_tf_array.npy")
+    small_tf_array = np.load("model/small_tf_array.npz")
     q_tf_array = sparse.load_npz('model/q_tf_array.npz')
     small_BG = np.load("model/small_BG.npy")
 
 #%%
 #idf
-idf = np.log(1+(len(d_list)+1) / (np.count_nonzero(small_tf_array, axis=1)+1))
+idf = np.log(1+(len(d_list)+1) / (small_tf_array.indptr[1:] - small_tf_array.indptr[:-1])+1)
 
 #%%
 # tfidf
-np_q_tfidf = (1 + np.ma.log2(q_tf_array.toarray())).transpose() * idf
-np_d_tfidf = (1 + np.ma.log2(small_tf_array)).transpose() * idf
-# del np_q_tf, np_d_tf
+q_tf_array = q_tf_array.transpose()
+small_tf_array = small_tf_array.transpose()
+
+
+np_q_tfidf = (1 + np.ma.log2(q_tf_array.toarray())) * idf
+np_d_tfidf = (1 + np.ma.log2(small_tf_array.toarray())) * idf
+# small_tf_array.data = np.log2(small_tf_array.data)
+# np_d_tfidf = (1+ small_tf_array.toarray()) * idf
 
 np_q_tfidf = np_q_tfidf.filled(0)
 np_d_tfidf = np_d_tfidf.filled(0)
 
 #%%
+# bm_sim_array
+if args.scratch:
+    bm_sim_array = np.zeros([len(q_list), len(d_list)])
+    for q in tqdm(range(len(q_list))):
+        for d in range(len(d_list)):
+            for w in query_list[q].split():
+                d_tf = (K1+1)*list_d_tf[d][w] / (K1*((1-bm_B) + bm_B*doc_len[d]/doc_avg_len) + list_d_tf[d][w])
+                q_tf = (K3+1)*list_q_tf[q][w] / (K3+list_q_tf[q][w]) if K3 != -1 else 1
+                idf = np.log(1+(len(d_list)-bm_df[w]+0.5) / (bm_df[w]+0.5))
+                idf = np.power(idf, 2)
+                bm_sim_array[q][d] += d_tf * q_tf * idf
+    np.save("model/bm_sim.npy", bm_sim_array)
+else:
+    bm_sim_array = np.load("model/bm_sim.npy")
+
+#%%
+sim_array = bm_sim_array
+
+#=================== BM25 ===================#
+
+#%%
+args = dotdict(A=1, B=0.2, C=0.15, step=10, r_doc=5, nr_doc=1, scratch=0)
+A = args.A
+B = args.B
+C = args.C
+r_doc = args.r_doc
+nr_doc = args.nr_doc
+
+#%%
 from sklearn.metrics.pairwise import cosine_similarity
+np_q_tfidf = (1 + np.ma.log2(q_tf_array.toarray())) * idf
+np_q_tfidf = np_q_tfidf.filled(0)
 sim_array = cosine_similarity(np_q_tfidf, np_d_tfidf)
 sim_array = np.array(sim_array)
 #========== VSM ==========#
 
 #%%
-new_q_tfidf = np.zeros(len(small_voc))
-for q in tqdm(range(len(q_list))):
-    relate_doc_vac = []
-    relate_arg = np.argsort(sim_array[q])[-5:]
-    relate_doc_vac = np.vstack([np_d_tfidf[_, :] for _ in relate_arg])
-    relate_doc_vac = relate_doc_vac.sum(0)
-    new_q_vac = A*np_q_tfidf[q] + B*relate_doc_vac/5
-    new_q_tfidf = np.vstack((new_q_tfidf, new_q_vac))
-new_q_tfidf = new_q_tfidf[1:]
-sim_array = cosine_similarity(new_q_tfidf, np_d_tfidf)
-sim_array = np.array(sim_array)
+from sklearn.metrics.pairwise import cosine_similarity
+for step in range(args.step):
+    new_q_tfidf = np.zeros(len(small_voc))
+    for q in tqdm(range(len(q_list))):
+        relate_doc_vac = []
+        relate_arg = np.argsort(sim_array[q])
+        relate_doc_vac = np.vstack([np_d_tfidf[_, :] for _ in relate_arg[-r_doc:]])
+        relate_doc_vac = relate_doc_vac.mean(0)
+        non_relate_doc_vac = np.vstack([np_d_tfidf[_, :] for _ in relate_arg[:nr_doc]])
+        non_relate_doc_vac = non_relate_doc_vac.mean(0)
+        new_q_vac = A*np_q_tfidf[q] + B*relate_doc_vac - C*non_relate_doc_vac
+        new_q_tfidf = np.vstack((new_q_tfidf, new_q_vac))
+    new_q_tfidf = new_q_tfidf[1:]
+    sim_array = cosine_similarity(new_q_tfidf, np_d_tfidf)
+    sim_array = np.array(sim_array)
+    np_q_tfidf = new_q_tfidf
 
 #%%
 # output
