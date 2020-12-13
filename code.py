@@ -37,7 +37,7 @@ class dotdict(dict):
     __getattr__ = dict.get
     __setattr__ = dict.__setitem__
     __delattr__ = dict.__delitem__
-args = dotdict(A=1, B=0.8, C=0.1, step=5, scratch=1, save=0)
+args = dotdict(A=1, B=0.8, C=0.1, step=5, scratch=0, save=0)
 
 # bm_B = args.bm_B
 # K1 = args.K1
@@ -50,7 +50,8 @@ C = args.C
 
 #%%
 timestamp()
-root_path = "../HW1 Vector Space Model/"
+# root_path = "../HW1 Vector Space Model/"
+root_path = "./"
 doc_path = root_path+"data/docs/"
 query_path = root_path+"data/queries/"
 
@@ -254,6 +255,15 @@ sim_array = bm_sim_array
 #=================== BM25 ===================#
 
 #%%
+from sklearn.feature_extraction.text import TfidfVectorizer, CountVectorizer, TfidfTransformer
+vectorizer = TfidfVectorizer(sublinear_tf=True, vocabulary=voc)
+np_d_tfidf = vectorizer.fit_transform(doc_list)    # input string of list
+idf = vectorizer.idf_
+vectorizer = CountVectorizer(vocabulary=voc)
+q_tf_array = vectorizer.fit_transform(query_list)    # input string of list
+np_q_tfidf = (sparse.csr_matrix.log1p(q_tf_array).multiply(idf)).tocsr()
+
+#%%
 args = dotdict(A=1, B=0.75, C=0.15, step=10, r_doc=5, nr_doc=1, scratch=0)
 A = args.A
 B = args.B
@@ -272,16 +282,16 @@ sim_array = np.array(sim_array)
 #%%
 from sklearn.metrics.pairwise import cosine_similarity
 for step in range(args.step):
-    new_q_tfidf = np.zeros(len(small_voc))
+    new_q_tfidf = sparse.csr_matrix((1,len(voc)))
     for q in tqdm(range(len(q_list))):
         relate_doc_vec = []
         relate_arg = np.argsort(sim_array[q])
-        relate_doc_vec = np.vstack([np_d_tfidf[_, :] for _ in relate_arg[-r_doc:]])
+        relate_doc_vec = sparse.vstack([np_d_tfidf[_, :] for _ in relate_arg[-r_doc:]])
         relate_doc_vec = relate_doc_vec.mean(0)
-        non_relate_doc_vec = np.vstack([np_d_tfidf[_, :] for _ in relate_arg[:nr_doc]])
+        non_relate_doc_vec = sparse.vstack([np_d_tfidf[_, :] for _ in relate_arg[:nr_doc]])
         non_relate_doc_vec = non_relate_doc_vec.mean(0)
         new_q_vec = A*np_q_tfidf[q] + B*relate_doc_vec - C*non_relate_doc_vec
-        new_q_tfidf = np.vstack((new_q_tfidf, new_q_vec))
+        new_q_tfidf = sparse.vstack((new_q_tfidf, new_q_vec)).tocsr()
     new_q_tfidf = new_q_tfidf[1:]
     sim_array = cosine_similarity(new_q_tfidf, np_d_tfidf)
     sim_array = np.array(sim_array)
