@@ -161,77 +161,32 @@ else:
     BG = np.load("model/BG.npy")
 
 #%%
-# small voc
-if args.scratch:
-    tf_array = tf_array.tocsr()
-    small_tf_array = []
-    small_voc = []
-    small_BG = []
-    for arg in tqdm(BG.argsort()[-10000: ]): # 15k~5k most fequent word [-15000: -5000]
-        small_tf_array += [tf_array[arg]]
-        small_voc += [voc[arg]]
-        small_BG += [BG[arg]]
-    small_tf_array = sparse.vstack([row for row in small_tf_array])
-    small_BG = np.array(small_BG)
-
-    with open("model/small_voc.pkl", "wb") as fp:
-        pickle.dump(small_voc, fp)
-    sparse.save_npz("model/small_tf_array.npz", small_tf_array)
-    q_tf_array = counter2array(small_voc, q_list, 'model/q_tf_array.npz', list_q_tf)
-    np.save("model/small_BG.npy", small_BG)
-else:
-    with open("model/small_voc.pkl", "rb") as fp:
-        small_voc = pickle.load(fp)
-    small_tf_array = np.load("model/small_tf_array.npz")
-    q_tf_array = sparse.load_npz('model/q_tf_array.npz')
-    small_BG = np.load("model/small_BG.npy")
-
-#%%
-# query voc
-small_voc = q_voc
-tf_array = tf_array.tocsr()
-small_tf_array = []
-small_BG = []
-for v in small_voc: # query word
-    arg = voc.index(v)
-    small_tf_array += [tf_array[arg]]
-    small_BG += [BG[arg]]
-small_tf_array = sparse.vstack([row for row in small_tf_array])
-small_BG = np.array(small_BG)
-if args.save:
-    sparse.save_npz("model/query/small_tf_array.npz", small_tf_array)
-    np.save("model/query/small_BG.npy", small_BG)
-q_tf_array = counter2array(small_voc, q_list, 'model/query/q_tf_array.npz', list_q_tf)
-
-#%%
 #idf
 tf_array = tf_array.tocsr()
-n_i = tf_array.indptr[1:] - tf_array.indptr[:-1]+1
-idf = np.log(1 + len(d_list) / n_i)#ndarray
-# n_i = small_tf_array.indptr[1:] - small_tf_array.indptr[:-1]+1
-# idf = np.log(1 + len(d_list) / n_i)#ndarray
+n_i = tf_array.indptr[1:] - tf_array.indptr[:-1]
+idf = 1 + np.log((len(d_list)+1) / (n_i+1)) # ndarray
 
 #%%
 # tfidf
-# q_tf_array = counter2array(voc, q_list, 'model/q_tf_array.npz', list_q_tf)
-# q_tf_array = q_tf_array.transpose()
-# tf_array = tf_array.transpose()
-# np_q_tfidf = q_tf_array.multiply(idf).tocsr()
-# np_d_tfidf = tf_array.multiply(idf).tocsr()
-
-
-# small
+q_tf_array = counter2array(voc, q_list, 'model/q_tf_array.npz', list_q_tf)
 q_tf_array = q_tf_array.transpose()
-# small_tf_array = small_tf_array.transpose()
-# tf_array = tf_array.transpose()
+tf_array = tf_array.transpose()
 
-np_q_tfidf = (1 + np.ma.log2(q_tf_array.toarray())) * idf
-np_d_tfidf = (1 + np.ma.log2(tf_array.toarray())) * idf
-# # small_tf_array.data = np.log2(small_tf_array.data)
-# # np_d_tfidf = (1+ small_tf_array.toarray()) * idf
+#%%
+# tf log norm
+# q_tf_array.data = 1 + np.log(q_tf_array.data)
+tf_array.data = 1 + np.log(tf_array.data)
+# tf*idf
+np_q_tfidf = (sparse.csr_matrix.log1p(q_tf_array).multiply(idf)).tocsr()
+np_d_tfidf = tf_array.multiply(idf).tocsr()
 
-np_q_tfidf = np_q_tfidf.filled(0)
-np_d_tfidf = np_d_tfidf.filled(0)
+#%%
+# tfidf norm
+if args.scratch:
+    for i, row in tqdm(enumerate(np_d_tfidf)):
+        np_d_tfidf[i] /= (row*row.T).power(0.5).data[0]
+else:
+    np_d_tfidf = sparse.load_npz("model/d_tfidf.npz").tocsr()
 
 #%%
 # bm_sim_array
@@ -256,15 +211,15 @@ sim_array = bm_sim_array
 
 #%%
 from sklearn.feature_extraction.text import TfidfVectorizer, CountVectorizer, TfidfTransformer
-vectorizer = TfidfVectorizer(sublinear_tf=True, vocabulary=voc)
-np_d_tfidf = vectorizer.fit_transform(doc_list)    # input string of list
-idf = vectorizer.idf_
-vectorizer = CountVectorizer(vocabulary=voc)
-q_tf_array = vectorizer.fit_transform(query_list)    # input string of list
-np_q_tfidf = (sparse.csr_matrix.log1p(q_tf_array).multiply(idf)).tocsr()
+vectorizer = TfidfVectorizer(sublinear_tf=True, vocabulary=voc, token_pattern=r"\S+")
+sk_np_d_tfidf = vectorizer.fit_transform(doc_list)    # input string of list
+sk_idf = vectorizer.idf_
+vectorizer = CountVectorizer(vocabulary=voc, token_pattern=r"\S+")
+sk_q_tf_array = vectorizer.fit_transform(query_list)    # input string of list
+sk_np_q_tfidf = (sparse.csr_matrix.log1p(sk_q_tf_array).multiply(idf)).tocsr()
 
 #%%
-args = dotdict(A=1, B=0.75, C=0.15, step=10, r_doc=5, nr_doc=1, scratch=0)
+args = dotdict(A=1, B=0.5, C=0.15, step=10, r_doc=5, nr_doc=1, scratch=0)
 A = args.A
 B = args.B
 C = args.C
@@ -284,7 +239,6 @@ from sklearn.metrics.pairwise import cosine_similarity
 for step in range(args.step):
     new_q_tfidf = sparse.csr_matrix((1,len(voc)))
     for q in tqdm(range(len(q_list))):
-        relate_doc_vec = []
         relate_arg = np.argsort(sim_array[q])
         relate_doc_vec = sparse.vstack([np_d_tfidf[_, :] for _ in relate_arg[-r_doc:]])
         relate_doc_vec = relate_doc_vec.mean(0)
