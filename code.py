@@ -8,7 +8,6 @@ from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter
 import pickle
 from scipy import sparse
 from scipy.sparse import coo_matrix
-from numba import jit
 
 def timestamp(msg=""):
     dt1 = datetime.utcnow().replace(tzinfo=timezone.utc)
@@ -25,11 +24,19 @@ def file_iter(_type):
             with open(doc_path+name+'.txt') as f:
                 yield f.readline()
 
-# parser = ArgumentParser(formatter_class=ArgumentDefaultsHelpFormatter)
-# parser.add_argument("-B", default=0.7, type=float ,help=" ")
-# parser.add_argument("-K1", default=0.8, type=float ,help=" ")
-# parser.add_argument("-K3", default=-1, type=float ,help="if K3 =-1 not use query TF")
-# args = parser.parse_args()
+parser = ArgumentParser(formatter_class=ArgumentDefaultsHelpFormatter)
+parser.add_argument("-bm_B", metavar="bm_beta", default=0.75, type=float ,help="BM model beta")
+parser.add_argument("-K1", default=3.5, type=float ,help="BM model K1")
+parser.add_argument("-K3", default=-1, type=float ,help="BM model K3; if -1 not use query TF")
+parser.add_argument("-A", metavar="alpha", default=1, type=float, help=" ")
+parser.add_argument("-B", metavar="beta", default=0.5, type=float, help=" ")
+parser.add_argument("-C", metavar="gamma", default=0.15, type=float,help=" ")
+parser.add_argument("-r_doc", default=5, type=int, help="the number of related documents")
+parser.add_argument("-nr_doc", default=1, type=int, help="the number of non-related documents")
+parser.add_argument("-step", default=5, type=int, help="Rocchio iteration step")
+parser.add_argument("-scratch", default=0, type=int, help=" ")
+parser.add_argument("-save", default=0, type=int, help=" ")
+args = parser.parse_args()
 
 #%%
 class dotdict(dict):
@@ -37,16 +44,15 @@ class dotdict(dict):
     __getattr__ = dict.get
     __setattr__ = dict.__setitem__
     __delattr__ = dict.__delitem__
-args = dotdict(A=1, B=0.8, C=0.1, step=5, scratch=0, save=0)
-
-# bm_B = args.bm_B
-# K1 = args.K1
-# K3 = args.K3
-# KL_A = args.KL_A
-# KL_B = args.KL_B
+# args = dotdict(bm_B=0.75, K1=3.5, K3=-1, A=1, B=0.5, C=0.15, step=5, r_doc=5, nr_doc=1, scratch=0, save=0)
+bm_B = args.bm_B
+K1 = args.K1
+K3 = args.K3
 A = args.A
 B = args.B
 C = args.C
+r_doc = args.r_doc
+nr_doc = args.nr_doc
 
 #%%
 timestamp()
@@ -142,8 +148,8 @@ else:
 #%%
 # df
 if args.scratch:
-    # with open("model/voc.pkl", "rb") as fp:
-    #     voc = pickle.load(fp)
+    with open("model/voc.pkl", "rb") as fp:
+        voc = pickle.load(fp)
     bm_df = dict.fromkeys(voc, 0)
     BG = [0] * len(voc)
     for j, doc in tqdm(enumerate(doc_list)):
@@ -167,17 +173,16 @@ n_i = tf_array.indptr[1:] - tf_array.indptr[:-1]
 idf = 1 + np.log((len(d_list)+1) / (n_i+1)) # ndarray
 
 #%%
-# tfidf
 q_tf_array = counter2array(voc, q_list, 'model/q_tf_array.npz', list_q_tf)
 q_tf_array = q_tf_array.transpose()
 tf_array = tf_array.transpose()
 
 #%%
 # tf log norm
-# q_tf_array.data = 1 + np.log(q_tf_array.data)
+q_tf_array.data = 1 + np.log(q_tf_array.data)
 tf_array.data = 1 + np.log(tf_array.data)
 # tf*idf
-np_q_tfidf = (sparse.csr_matrix.log1p(q_tf_array).multiply(idf)).tocsr()
+np_q_tfidf = q_tf_array.multiply(idf).tocsr()
 np_d_tfidf = tf_array.multiply(idf).tocsr()
 
 #%%
@@ -187,6 +192,9 @@ if args.scratch:
         np_d_tfidf[i] /= (row*row.T).power(0.5).data[0]
 else:
     np_d_tfidf = sparse.load_npz("model/d_tfidf.npz").tocsr()
+
+for i, row in tqdm(enumerate(np_q_tfidf)):
+    np_q_tfidf[i] /= (row*row.T).power(0.5).data[0]
 
 #%%
 # bm_sim_array
@@ -207,33 +215,6 @@ else:
 #%%
 sim_array = bm_sim_array
 
-#=================== BM25 ===================#
-
-#%%
-from sklearn.feature_extraction.text import TfidfVectorizer, CountVectorizer, TfidfTransformer
-vectorizer = TfidfVectorizer(sublinear_tf=True, vocabulary=voc, token_pattern=r"\S+")
-sk_np_d_tfidf = vectorizer.fit_transform(doc_list)    # input string of list
-sk_idf = vectorizer.idf_
-vectorizer = CountVectorizer(vocabulary=voc, token_pattern=r"\S+")
-sk_q_tf_array = vectorizer.fit_transform(query_list)    # input string of list
-sk_np_q_tfidf = (sparse.csr_matrix.log1p(sk_q_tf_array).multiply(idf)).tocsr()
-
-#%%
-args = dotdict(A=1, B=0.5, C=0.15, step=10, r_doc=5, nr_doc=1, scratch=0)
-A = args.A
-B = args.B
-C = args.C
-r_doc = args.r_doc
-nr_doc = args.nr_doc
-
-#%%
-from sklearn.metrics.pairwise import cosine_similarity
-# np_q_tfidf = (1 + np.ma.log2(q_tf_array.toarray())) * idf
-# np_q_tfidf = np_q_tfidf.filled(0)
-sim_array = cosine_similarity(np_q_tfidf, np_d_tfidf)
-sim_array = np.array(sim_array)
-#========== VSM ==========#
-
 #%%
 from sklearn.metrics.pairwise import cosine_similarity
 for step in range(args.step):
@@ -247,8 +228,8 @@ for step in range(args.step):
         new_q_vec = A*np_q_tfidf[q] + B*relate_doc_vec - C*non_relate_doc_vec
         new_q_tfidf = sparse.vstack((new_q_tfidf, new_q_vec)).tocsr()
     new_q_tfidf = new_q_tfidf[1:]
-    sim_array = cosine_similarity(new_q_tfidf, np_d_tfidf)
-    sim_array = np.array(sim_array)
+    sim_array = new_q_tfidf*np_d_tfidf.T # row-wise dot product = matrix multiply
+    sim_array = sim_array.toarray()
     np_q_tfidf = new_q_tfidf
 
 #%%
@@ -263,4 +244,3 @@ with open('result.csv', 'w') as output_file:
             output_file.write(d_list[j]+' ')
         output_file.write('\n')
 timestamp()
-# %%
